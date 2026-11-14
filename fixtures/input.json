@@ -1,0 +1,29 @@
+{
+  "trace_id": "sample",
+  "spans": [
+    {
+      "id": "root",
+      "parent": null,
+      "start": 0,
+      "end": 20
+    },
+    {
+      "id": "A",
+      "parent": "root",
+      "start": 2,
+      "end": 10
+    },
+    {
+      "id": "B",
+      "parent": "root",
+      "start": 7,
+      "end": 15
+    },
+    {
+      "id": "C",
+      "parent": "A",
+      "start": 3,
+      "end": 6
+    }
+  ]
+}
