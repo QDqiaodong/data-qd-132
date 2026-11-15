@@ -9,3 +9,56 @@
 样例根20、A8、B8、C3；根子并集13、exclusive7，A exclusive5；总span39。
 输出按id排序，与输入顺序无关。该模型估算未被子span覆盖的时间，不推断CPU消耗、阻塞原因、
 调用概率、服务关键路径或分布式时钟修复；不采集真实遥测、不提供在线存储。
+
+# Warehouse revision & occupancy contract v2
+
+离线 SQLite 仓库在 v1 校验规则之上增加持久化修订与服务占用分析，仅用 Python 标准库。
+
+## 批次输入
+
+严格为 `{batch_id, events}`；events 为非空数组，每批最多 5000 项。每项含
+`seq`、`trace_id`、`op`，且按 op 限定字段：
+
+* `upsert`：另有 `span:{id,parent,start,end,service}`，替换该 trace 下同 id 的完整
+  span；id 与 service 走同一 ident 校验（非空、去边空白、<=128 字符、无控制字符）。
+* `delete`：另有 `id`；删除不存在的 id 为错误。
+* `seal`：无其他字段。
+
+`seq` 与 start/end 必须是 Python int（bool 拒绝），全库 seq 从 1 连续递增，
+tick 为 0..10^12 的整数，允许零时长，end 不得小于 start。沿用 8MB 上限、重复
+JSON 键拒绝、未知字段拒绝。
+
+## 幂等
+
+`batch_id` 首次提交后记录规范化 JSON（键排序）的 SHA256 与分配到的 seq 区间。
+同内容重试返回原序号、`replayed=true` 且不写入；内容变化（哪怕一个字节的语义
+差异）必须拒绝。对象键顺序不影响判等。
+
+## trace 生命周期
+
+新 trace 为草稿。草稿允许父引用暂缺、成环、子区间暂时越界，但每个 span 字段仍须
+逐项合法；每条 trace 最多 5000 个 span。seal 时复用 v1 的单根、完整引用、可达无环、
+区间包含规则，通过后才变为已封存并写入分析索引。对已封存 trace 的任何
+upsert/delete 先将其重新打开为草稿并撤销整条 trace 的旧贡献；再次 seal 通过后才
+重新写入。批内任意错误整批回滚（span、trace 状态、seq、batch_id、索引全部撤回），
+跨进程重开数据库后同样成立。
+
+## 占用与查询
+
+每个已封存 trace 中，span 占用区间 = 自身半开区间 − 直接子 span 区间并集（保留
+片段位置）；同 trace 同 service 的片段再取并集，重叠兄弟只计一条 trace。跨 trace
+累加并发；零长度片段不贡献，端点相接不产生瞬时峰值。
+
+查询严格为 `{service,start,end}` 且 start<end，返回 service、start、end、max_seq、
+histogram（按并发数递增的 {concurrency,ticks}，只列正时长桶）、peak、
+occupied_ticks（非零桶时长和）、trace_ticks（Σ concurrency×ticks）。histogram 的
+ticks 之和恒为 end-start；无该服务返回全窗零并发。查询取自一个 SQLite 一致读快照，
+max_seq、封存集合与索引严格对应。
+
+## 规模与持久化
+
+支持累计 10 万条 trace、百万贡献端点。查询只读取该服务窗内 K 个实际端点，加至多
+O(log U)（U=10^12+1，<=40）个 Fenwick 聚合节点取得左端基数，不扫描 span 表、
+窗外端点或逐 tick 展开；额外内存 O(K+5000)。更新只重算本批触及 trace 的贡献与
+相关索引，不重建其他 trace。批次状态、可撤销贡献、前缀聚合、max_seq 在同一事务
+提交；COMMIT 前进程终止则整批回滚，重试仍只生效一次。

@@ -1,0 +1,39 @@
+{
+  "batch_id": "fixture-batch-1",
+  "events": [
+    {
+      "seq": 1,
+      "trace_id": "trace-a",
+      "op": "upsert",
+      "span": {
+        "id": "root",
+        "parent": null,
+        "start": 0,
+        "end": 10,
+        "service": "api"
+      }
+    },
+    {
+      "seq": 2,
+      "trace_id": "trace-b",
+      "op": "upsert",
+      "span": {
+        "id": "root",
+        "parent": null,
+        "start": 5,
+        "end": 15,
+        "service": "api"
+      }
+    },
+    {
+      "seq": 3,
+      "trace_id": "trace-a",
+      "op": "seal"
+    },
+    {
+      "seq": 4,
+      "trace_id": "trace-b",
+      "op": "seal"
+    }
+  ]
+}
