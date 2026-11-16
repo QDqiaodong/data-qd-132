@@ -62,3 +62,74 @@ O(log U)（U=10^12+1，<=40）个 Fenwick 聚合节点取得左端基数，不�
 窗外端点或逐 tick 展开；额外内存 O(K+5000)。更新只重算本批触及 trace 的贡献与
 相关索引，不重建其他 trace。批次状态、可撤销贡献、前缀聚合、max_seq 在同一事务
 提交；COMMIT 前进程终止则整批回滚，重试仍只生效一次。
+
+# Tail-sampling collection pipeline contract v3
+
+离线尾部采样采集管道把不可变 UTF-8 JSONL 遥测流转成可恢复数据集，仅用 Python
+标准库，单进程运行。入口：`trace-latency sample-traces --source INPUT.jsonl
+--state STATE_DIR --output OUTPUT_DIR --policy POLICY.json`；任何契约、身份或
+冲突违规退出 2。
+
+## policy
+
+严格为 `{normal_budget, slow_ticks}`：分别为整数 0..10000 与 0..10^12，布尔
+拒绝；沿用 8MB、重复键、非有限数拒绝。原始字节 SHA256 记入每个水位清单。
+
+## source（JSONL）
+
+每行一个 JSON 对象，最多 1 MB（1 000 000 字节），末行允许没有换行；空行、
+重复键、未知字段、非有限数（含 1e999 类溢出）拒绝。记录按 kind 严格限定字段：
+
+* `span`：`{kind,trace_id,span}`；span 严格为 `{id,parent,start,end,service,
+  error}`，`error` 为 bool，其余沿用仓库 span 字段规则（ident、tick 0..10^12、
+  end>=start、布尔拒绝）。
+* `finish`：`{kind,trace_id,root_id,end,span_count}`；声明预期根、根结束 tick
+  与 1..5000 个唯一 span。
+* `watermark`：`{kind,value}`；value 为严格递增 tick。
+
+span 与 finish 可先后倒置；同一 trace 的同 id span 或 finish 仅解析内容完全
+相同（键顺序不影响判等）才算重复并忽略，冲突退出 2。每 trace 最多 5000 span。
+
+## 组装
+
+水位 W 只终结已收到 finish 且 finish.end<=W 的 trace；无 finish 继续等待。
+终结时核唯一 span 数、预期根、根 end，并复用 validate_sealed 的单根、完整
+引用、可达无环、区间包含语义；失败隔离（quarantine），稳定错误码：
+`span_count_mismatch`、`root_count`、`unknown_parent`、`interval_containment`、
+`cycle`、`root_mismatch`、`root_end_mismatch`（`empty_trace`、`invalid_tree`
+为防御性兜底）。隔离只发生一次；终结后新 span 或不同内容记录退出 2，精确
+重复忽略；新 trace 首个 finish 的 end 不大于已发布水位退出 2。EOF 不是隐式
+水位：未终结内容持久保留并报告 pending 数，重跑不重复消费。
+
+## 采样
+
+任一 span.error=true 或根耗时>=slow_ticks 的合法 trace 必保留（reason `error`
+优先于 `slow`），不占名额；其余按根 service 各选 normal_budget 条，候选按
+SHA256(trace_id UTF-8 字节) 摘要字节升序、再按 trace_id 字节序取前 B 条，
+输入顺序不影响结果。隔离项不占名额，等待态不提前输出。
+
+## 输出
+
+每个水位产出 `watermark-W/`：`kept.jsonl`（`{trace_id,service,reason,spans}`，
+spans 含全部原始字段按 id 字节序）、`dropped.jsonl`
+（`{trace_id,service,reason:"budget"}`）、`quarantine.jsonl`
+（`{trace_id,reason}`），三类均按 trace_id UTF-8 字节序；`manifest.json` 含
+watermark、源文件与 policy 原始字节 SHA256、三个文件的 SHA256 与条数。无终结
+trace 的水位也生成空文件与清单。
+
+## 状态与恢复
+
+SQLite 状态记录输入消费偏移、等待内容、重复判等证据（每 span 规范化内容
+SHA256 与 finish 声明，永久保留，不得为省空间接受过去冲突）与已发布水位。
+重跑先核源文件与 policy 身份，不符退出 2 并保留有效数据集。发布协议：staging
+目录写齐四个文件 → 原子 rename 对外可见 → 同一事务推进状态；进程在三个边界
+任一处被终止，重跑不重复不漏决策、不跳过未发布水位、不替换已确认有效水位
+（已可见目录逐字节核对后保留）。输入错误退出 2，只保留错误前已发布水位。
+EOF 时尚未终结内容持久保留并报告 pending 数。
+
+## 规模
+
+支持 100 万条交错等待 trace、每条最多 5000 span、超过内存的单水位候选集；
+除处理一条 trace 所需内存外，其余工作内存（含数据库缓存与排序缓冲）最多
+64 MiB，不随等待 trace 数或候选数增长；允许临时落盘，不整文件加载，不在
+每条输入后遍历全部等待 trace。

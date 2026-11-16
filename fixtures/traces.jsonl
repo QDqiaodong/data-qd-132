@@ -1,0 +1,13 @@
+{"kind":"finish","trace_id":"t-alpha","root_id":"root","end":10,"span_count":2}
+{"kind":"span","trace_id":"t-alpha","span":{"id":"child","parent":"root","start":2,"end":8,"service":"db","error":false}}
+{"kind":"span","trace_id":"t-alpha","span":{"id":"root","parent":null,"start":0,"end":10,"service":"api","error":false}}
+{"kind":"watermark","value":10}
+{"kind":"span","trace_id":"t-beta","span":{"id":"root","parent":null,"start":0,"end":100,"service":"api","error":false}}
+{"kind":"finish","trace_id":"t-beta","root_id":"root","end":100,"span_count":1}
+{"kind":"span","trace_id":"t-gamma","span":{"id":"root","parent":null,"start":0,"end":15,"service":"db","error":true}}
+{"kind":"finish","trace_id":"t-gamma","root_id":"root","end":15,"span_count":1}
+{"kind":"span","trace_id":"t-delta","span":{"id":"root","parent":null,"start":0,"end":15,"service":"api","error":false}}
+{"kind":"finish","trace_id":"t-delta","root_id":"root","end":15,"span_count":3}
+{"kind":"span","trace_id":"t-epsilon","span":{"id":"root","parent":null,"start":0,"end":3,"service":"api","error":false}}
+{"kind":"watermark","value":20}
+{"kind":"watermark","value":100}

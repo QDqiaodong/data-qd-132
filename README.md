@@ -1,7 +1,8 @@
 # data-qd-132 · 调用链耗时分解与离线占用仓库
 
 Nested trace validation、exclusive interval latency accounting，以及一个可修订、
-可撤销、可重复提交的离线 SQLite 服务占用分析仓库。业务输入、计算和当前边界详见
+可撤销、可重复提交的离线 SQLite 服务占用分析仓库；另有把乱序遥测 JSONL 转成
+可恢复尾部采样数据集的离线采集管道。业务输入、计算和当前边界详见
 [数据契约](docs/contract.md)。
 
 ## 安装与演示
@@ -19,6 +20,9 @@ python3 -m venv .venv
 # 新的 SQLite 仓库入口
 .venv/bin/trace-latency warehouse-apply --db run/warehouse.db --source batch.json --output run/apply.json
 .venv/bin/trace-latency warehouse-query --db run/warehouse.db --source query.json --output run/query.json
+# 乱序遥测 JSONL 的尾部采样采集管道
+.venv/bin/trace-latency sample-traces --source fixtures/traces.jsonl \
+    --state run/sample-state --output run/sample-out --policy fixtures/policy.json
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -29,9 +33,9 @@ python3 -m venv .venv
 输出是可独立读取的JSON；成功后原子替换，输入/计算失败退出2并保留旧报告。
 输入和输出不得相同，输出符号链接拒绝。测试使用临时目录，运行产物在忽略的run/。
 
-src/trace_latency/model.py 为旧业务模型，warehouse.py 为 SQLite 仓库，相关算法模块
-独立组织；common.py 提供受限JSON及报告发布，cli.py 衔接两条数据链路。
-fixtures 为明确自制样例，代码与样例采用MIT许可。
+src/trace_latency/model.py 为旧业务模型，warehouse.py 为 SQLite 仓库，sampler.py 为
+尾部采样采集管道，相关算法模块独立组织；common.py 提供受限JSON及报告发布，cli.py
+衔接三条数据链路。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
 ## 旧 JSON 分析入口（保持不变）
 
@@ -145,6 +149,106 @@ trace 贡献一次，而不是按 span 数计数。跨 trace 才累加并发数�
 其他 trace 的贡献行与聚合节点从不重建。归零的 Fenwick 节点在提交前清理，保证
 稀疏表不随反复修订无限增长。进程在 COMMIT 前终止时事务整体回滚，`batches`
 中没有该批次，重试仍只生效一次。
+
+## 离线尾部采样采集管道
+
+`sample-traces --source INPUT.jsonl --state STATE_DIR --output OUTPUT_DIR --policy
+POLICY.json` 把乱序到达的遥测 JSONL 转成可恢复的数据集：整条调用链完成后做尾部
+采样，错误/慢请求必保留，普通请求按根服务限制存储名额。仅用 Python 标准库
+（含 `sqlite3`），单进程运行，不要求并发写或断电恢复。Python API 为
+`trace_latency.sample_traces(source, state_dir, output_dir, policy)`，返回与 CLI
+stdout 相同的报告（`pending`、`watermarks_published`、`last_watermark`、
+`kept/dropped/quarantined` 等）。
+
+### 输入契约
+
+* policy 严格为 `{normal_budget, slow_ticks}`：`normal_budget` 整数 0..10000，
+  `slow_ticks` 整数 0..10^12，布尔一律拒绝；走仓库共用的受限 JSON 读取（8MB、
+  重复键、非有限数拒绝），原始字节 SHA256 记入每个水位清单。
+* source 是不可变 UTF-8 JSONL：每行一个 JSON 对象、最多 1 MB（1 000 000 字节），
+  末行允许没有换行；空行、重复 JSON 键、未知字段、非有限数（NaN/Infinity/溢出）
+  一律退出 2。
+* 记录严格按 kind 限定字段：
+  * `{"kind":"span","trace_id":…,"span":{id,parent,start,end,service,error}}`；
+    `error` 为 bool，其余字段沿用仓库 span 规则（ident、tick 0..10^12 整数、
+    end>=start、布尔拒绝）。
+  * `{"kind":"finish","trace_id":…,"root_id":…,"end":…,"span_count":…}`：声明预期
+    根、根结束 tick 与 1..5000 个唯一 span。
+  * `{"kind":"watermark","value":…}`：value 为严格递增的 tick。
+* span 与 finish 可任意先后到达；同一 trace 的同 id span 或 finish 只有解析内容
+  完全相同（键顺序不影响判等）才算重复并忽略，内容冲突退出 2。每条 trace 最多
+  5000 个 span，超出即输入错误。
+
+### 组装语义
+
+水位 W 只终结“已收到 finish 且 finish.end<=W”的 trace；没有 finish 的继续等待。
+终结时核对唯一 span 数、预期根与根 end，并复用仓库 `validate_sealed` 的单根、
+完整引用、可达无环、区间包含语义；失败进 quarantine 而非参与采样，稳定错误码：
+`span_count_mismatch`、`root_count`、`unknown_parent`、`interval_containment`、
+`cycle`、`root_mismatch`、`root_end_mismatch`（`empty_trace`/`invalid_tree` 为
+防御性兜底）。隔离只发生一次，后续补齐不能倒改已发布结果：终结后新 span 或不同
+内容的记录退出 2，精确重复仍忽略；新 trace 首个 finish 的 end 不大于已发布水位
+也退出 2（禁止追溯补入）。EOF 不是隐式水位：未终结内容持久保留并报告 pending
+数，同一文件重跑不会重复消费。
+
+### 采样语义
+
+每个水位内，合法 trace 任一 span.error=true 或根耗时>=slow_ticks 必保留（reason
+`error` 优先于 `slow`），不占普通名额；其余按根 service 各选 normal_budget 条。
+普通候选按 SHA256(trace_id 的 UTF-8 字节) 完整摘要字节升序、再按 trace_id 字节序
+取前 B 条，同水位段内输入顺序不影响结果。只有组装在水位完成完整树校验并给出根
+service、根耗时与错误状态后，采样器才决定候选所属服务与是否占预算；隔离项不占
+名额，等待态不提前输出。
+
+### 输出布局
+
+每个水位产出 `watermark-W/` 目录：
+
+* `kept.jsonl`：`{trace_id,service,reason,spans}`，reason ∈ error/slow/normal，
+  spans 保留所有原始 span 字段并按 id 字节序排列；
+* `dropped.jsonl`：`{trace_id,service,reason:"budget"}`；
+* `quarantine.jsonl`：`{trace_id,reason}`，reason 为上述稳定错误码；
+* `manifest.json`：`{watermark, source_sha256, policy_sha256, files}`，files 含
+  三个文件的 SHA256 与条数。
+
+三类 JSONL 均按 trace_id 的 UTF-8 字节序排列；即使没有终结 trace 的水位也生成
+空文件与清单。所有行是紧凑 UTF-8 JSON（键排序），数据集可字节级比对。
+
+### 状态与崩溃恢复
+
+state 目录内是 SQLite（WAL）：`meta`（源/policy 身份 SHA256、消费字节偏移、已
+发布水位）、`traces`（waiting/finalized 与 finish 声明）、`spans`（等待内容）、
+`evidence`（已终结 trace 每 span 的规范化内容 SHA256）。重跑先流式核对源文件与
+policy 身份，不符退出 2 且保留有效数据集；随后从已提交偏移继续，不重复消费。
+
+发布与消费进度按下述协议协调：每个水位先把四个文件写进 `.staging-W`，再原子
+rename 为 `watermark-W`，最后在同一个 SQLite 事务里推进偏移/水位并清理已终结
+等待内容。进程在“文件全部写好 / 目录对外可见 / 状态推进”三个边界任一处被终止，
+重跑都不重复、不漏掉 trace 决策：staging 残留先清理；已可见但未提交的水位目录
+逐字节核对后**保留原样**（绝不替换其他已确认有效水位），状态补齐；已提交的水位
+直接跳过，未发布水位不会被跳过。输入错误退出 2：只保留错误前已发布的水位，
+未发布部分不留可见结果。测试用故障注入钩子
+`TRACE_LATENCY_SAMPLE_CRASH=files|rename|commit:N`（N 为本次运行第 N 个水位）
+在三个边界杀进程，仅测试使用。
+
+### 资源代价（组装索引、预算选择、状态清理）
+
+* 组装索引：每条记录只做 O(log n) 次索引访问——traces 主键定位、spans 主键
+  (trace_id,span_id) 判重、finish 主键更新；终结扫描用部分索引
+  `(finish_end) WHERE status='waiting' AND finish_end IS NOT NULL`，只触及本水位
+  可终结的行，绝不在每条输入后遍历全部等待 trace。等待内容全部落 SQLite，
+  主/临时页缓存各限 8 MiB。
+* 预算选择：候选写入临时表，`ORDER BY service,digest,trace_id` 由 SQLite 外排序
+  （temp_store=FILE 落盘），逐行流式判定名额；输出再按 trace_id 外排序写出。
+  单水位候选集可以超过内存，排序缓冲不随候选数增长。
+* 已完成状态清理：终结在同一事务里把 trace 置为 finalized、删除其等待 spans、
+  并把每 span 的规范化内容 SHA256 写入 evidence、finish 声明留在 traces——这是
+  重放时区分“精确重复（忽略）”与“冲突/新增（退出 2）”的必要证据，用磁盘换取
+  绝不为省空间接受过去冲突。
+* 除处理一条 trace（≤5000 span）所需内存外，其余工作内存（含数据库缓存与排序
+  缓冲）最多 64 MiB，不随等待 trace 数或本次候选数增长：支持 100 万条交错等待
+  trace、每条最多 5000 span、超过内存的单水位候选集。测试以 ru_maxrss 增量
+  验证该上界。
 
 ## 业务与样例结果
 

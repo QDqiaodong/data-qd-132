@@ -4,6 +4,7 @@ from pathlib import Path
 from .common import read, save
 from .model import analyze
 from . import warehouse
+from . import sampler
 
 
 def run(source):
@@ -18,9 +19,9 @@ def legacy_parser():
     return parser
 
 
-def warehouse_parser():
+def command_parser():
     parser = argparse.ArgumentParser(description=DESCRIPTION)
-    sub = parser.add_subparsers(dest='warehouse_cmd', required=True)
+    sub = parser.add_subparsers(dest='command', required=True)
     applied = sub.add_parser('warehouse-apply',
                              help='apply one revision batch to a SQLite warehouse')
     applied.add_argument('--db', type=Path, required=True)
@@ -31,18 +32,28 @@ def warehouse_parser():
     queried.add_argument('--db', type=Path, required=True)
     queried.add_argument('--source', type=Path, required=True)
     queried.add_argument('--output', type=Path, required=True)
+    sampled = sub.add_parser('sample-traces',
+                             help='collect out-of-order trace JSONL into a '
+                                  'recoverable tail-sampling dataset')
+    sampled.add_argument('--source', type=Path, required=True)
+    sampled.add_argument('--state', type=Path, required=True)
+    sampled.add_argument('--output', type=Path, required=True)
+    sampled.add_argument('--policy', type=Path, required=True)
     return parser
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ('warehouse-apply', 'warehouse-query'):
-        args = warehouse_parser().parse_args(argv)
+    if argv and argv[0] in ('warehouse-apply', 'warehouse-query', 'sample-traces'):
+        args = command_parser().parse_args(argv)
     else:
         args = legacy_parser().parse_args(argv)
-        args.warehouse_cmd = None
+        args.command = None
     try:
-        if args.warehouse_cmd == 'warehouse-apply':
+        if args.command == 'sample-traces':
+            report = sampler.sample_traces(args.source, args.state,
+                                           args.output, args.policy)
+        elif args.command == 'warehouse-apply':
             data, digest = read(args.source)
             result = warehouse.apply_batch(args.db, data)
             report = {'schema_version': 2, 'kind': 'warehouse_apply',
@@ -51,7 +62,7 @@ def main(argv=None):
                 if args.source.resolve() == args.output.resolve():
                     raise ValueError('input and output must differ')
                 save(args.output, report)
-        elif args.warehouse_cmd == 'warehouse-query':
+        elif args.command == 'warehouse-query':
             data, digest = read(args.source)
             result = warehouse.query(args.db, data)
             report = {'schema_version': 2, 'kind': 'warehouse_query',
