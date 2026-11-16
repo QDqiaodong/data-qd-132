@@ -588,7 +588,13 @@ def sample_traces(source, state_dir, output_dir, policy):
     source_sha = _sha256_file(source)
     state_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    conn = _connect(state_dir / 'sampler.db')
+    db_file = state_dir / 'sampler.db'
+    # A bound sampler locates and verifies its catalog itself; an active
+    # retirement request closes this entry before any business data is read
+    # and before consumption offsets or watermarks can advance.
+    from .retirement import gate_for_db
+    gate = gate_for_db(db_file, 'sampler_db')
+    conn = _connect(db_file)
     staging = None
     try:
         _ensure_schema(conn)
@@ -619,6 +625,20 @@ def sample_traces(source, state_dir, output_dir, policy):
             for offset, obj in _iter_jsonl(stream, offset):
                 record = _record(obj)
                 kind = record[0]
+                # Retired ids are skipped on sight: structurally valid
+                # span/finish records (including content that differs from
+                # anything seen before) create no trace, spend no budget and
+                # never trigger past-conflict errors; the offset still
+                # advances, so normal consumption proceeds.
+                if gate is not None and kind in ('span', 'finish') \
+                        and gate.is_blocked(record[1]):
+                    pending_records += 1
+                    if pending_records >= BATCH_RECORDS:
+                        _set_meta(conn, 'offset', str(offset))
+                        conn.execute('COMMIT')
+                        conn.execute('BEGIN IMMEDIATE')
+                        pending_records = 0
+                    continue
                 if kind == 'span':
                     _process_span(conn, record[1], record[2])
                 elif kind == 'finish':
@@ -668,3 +688,5 @@ def sample_traces(source, state_dir, output_dir, policy):
         raise
     finally:
         conn.close()
+        if gate is not None:
+            gate.close()

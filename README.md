@@ -23,6 +23,10 @@ python3 -m venv .venv
 # 乱序遥测 JSONL 的尾部采样采集管道
 .venv/bin/trace-latency sample-traces --source fixtures/traces.jsonl \
     --state run/sample-state --output run/sample-out --policy fixtures/policy.json
+# 定向退役：catalog 绑定一个仓库 + 一个采样状态/输出资源组
+.venv/bin/trace-latency retire-traces --catalog run/retire-catalog \
+    --db run/warehouse.db --state run/sample-state --output run/sample-out \
+    --source run/retire-request.json
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -249,6 +253,60 @@ rename 为 `watermark-W`，最后在同一个 SQLite 事务里推进偏移/水�
   缓冲）最多 64 MiB，不随等待 trace 数或本次候选数增长：支持 100 万条交错等待
   trace、每条最多 5000 span、超过内存的单水位候选集。测试以 ru_maxrss 增量
   验证该上界。
+
+## 离线 trace 定向退役（retire-traces）
+
+运维人员收到一批 trace_id 后，`retire-traces` 清除其在纳管仓库、采样状态
+和已发布采样数据集中的业务载荷，并阻止原始遥测重入。外部只读
+JSON/JSONL 归档永不改写；这不是法证级磁盘擦除，只保留退役 trace_id、
+请求摘要、必要计数，以及整批幂等摘要/序号和 source/policy 文件级 SHA。
+仅用 Python 标准库，单进程维护。Python API 为
+`trace_latency.retire_traces(catalog, db, state_dir, output_dir, source)`。
+
+### catalog 绑定与入口管控
+
+catalog 管理且只管理一组三个资源：warehouse DB、`STATE/sampler.db` 与
+采样输出根。首次使用校验三者确为已有合法资源（清单与文件摘要/条数一致、
+输出最大水位与采样 `last_watermark` 一致、无已发布水位时没有 watermark
+目录），再把 catalog 的规范绝对路径登记进两个 SQLite 的
+`meta.retirement_catalog` 和输出根的 `.trace-latency-retirement` 标记，
+catalog 的 `binding.json` 记录这三个路径。禁止交叉绑定、别名让一个资源
+加入两个 catalog、把源文件或 catalog 当目标；初始化中断可用同组路径恢复，
+部分绑定时不会激活退役请求。
+
+### 控制平面与清理
+
+`retire.db` 持久登记 request_id、按 UTF-8 字节序规范化的请求集合摘要、
+单调序号、active/done 状态、只增不减的累计屏蔽集合和每步骤的首次计数。
+同 request_id 同集合（顺序无关）重试继续或返回原序号，换集合拒绝，未知
+trace 也进入屏蔽集合；新请求只在上一请求完成后接收。清理职责：
+
+* 仓库删除命中 trace 的 draft/sealed 行与 span，sealed 撤销原
+  contrib_endpoints 与 Fenwick 贡献并清理归零节点，保留其他 trace、
+  原 max_seq 与 `batches` 幂等证据；
+* 采样状态删除命中的等待/终结 trace、span、finish 与逐 span 判等证据，
+  保持 source/policy 身份、消费偏移和水位；
+* 逐个 watermark 从 kept/dropped/quarantine 流式移除命中记录，幸存行
+  字节与顺序不变，更新 manifest 摘要和条数，保留 source/policy SHA 与
+  水位；无命中目录的全部文件字节不变。
+
+### 入口驱动、诚实恢复与规模
+
+只要存在未完成请求，warehouse-apply、warehouse-query、sample-traces
+（含 Python API）一律先退出 2，不读业务结果、不接新批次、不推进消费位置
+或水位；省略参数无法绕过，catalog 丢失/绑定不符同样关闭入口。完成后
+warehouse 批次只要含屏蔽 ID 就整批拒绝（旧 batch_id 重试也不例外），
+sampler 对屏蔽 ID 的合法 span/finish 直接跳过（允许内容不同、不冲突、
+不占名额）但照常推进消费，未纳管资源的旧契约不变。
+
+请求先持久激活再清理，全部完成才标记完成；每步骤先持久化首次计数再动手，
+仓库/采样按块事务提交、输出逐文件原子替换且 manifest 最后替换，任意边界
+被终止后跨进程重试都继续同一请求、首次计数不少报、不从归档恢复载荷。
+工作内存上限 64 MiB：请求集合至多 1 万 id 全量驻留，其余全部流式，支持
+10 万仓库 trace、100 万采样等待 trace 与超过内存的输出。测试钩子
+`TRACE_LATENCY_RETIRE_CRASH=accept|warehouse_commit|sampler_commit|
+wmbefore:W|wmafterfiles:W|wmdone:W|complete` 仅测试使用，在对应边界杀进程，
+由 `tests/test_retirement_crash.py` 用子进程故障注入覆盖恢复与阻断。
 
 ## 业务与样例结果
 

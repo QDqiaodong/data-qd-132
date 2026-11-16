@@ -5,6 +5,7 @@ from .common import read, save
 from .model import analyze
 from . import warehouse
 from . import sampler
+from . import retirement
 
 
 def run(source):
@@ -39,18 +40,32 @@ def command_parser():
     sampled.add_argument('--state', type=Path, required=True)
     sampled.add_argument('--output', type=Path, required=True)
     sampled.add_argument('--policy', type=Path, required=True)
+    retired = sub.add_parser('retire-traces',
+                             help='retire a bounded set of trace ids from one '
+                                  'catalog-bound warehouse/sampler resource set')
+    retired.add_argument('--catalog', type=Path, required=True)
+    retired.add_argument('--db', type=Path, required=True)
+    retired.add_argument('--state', type=Path, required=True)
+    retired.add_argument('--output', type=Path, required=True)
+    retired.add_argument('--source', type=Path, required=True)
     return parser
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ('warehouse-apply', 'warehouse-query', 'sample-traces'):
+    if argv and argv[0] in ('warehouse-apply', 'warehouse-query',
+                            'sample-traces', 'retire-traces'):
         args = command_parser().parse_args(argv)
     else:
         args = legacy_parser().parse_args(argv)
         args.command = None
     try:
-        if args.command == 'sample-traces':
+        if args.command == 'retire-traces':
+            result = retirement.retire_traces(
+                args.catalog, args.db, args.state, args.output, args.source)
+            report = {'schema_version': 4, 'kind': 'retire_traces',
+                      'result': result}
+        elif args.command == 'sample-traces':
             report = sampler.sample_traces(args.source, args.state,
                                            args.output, args.policy)
         elif args.command == 'warehouse-apply':

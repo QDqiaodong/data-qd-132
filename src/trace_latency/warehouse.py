@@ -436,10 +436,28 @@ def apply_locked(conn, batch_id, events, digest, touched=None):
             'events': len(events), 'replayed': False, 'max_seq': new_max}
 
 
+def _retirement_gate(db_path):
+    """Open the catalog gate for a managed warehouse, else ``None``.
+
+    Imported lazily to avoid the import cycle (retirement reuses warehouse
+    internals).  A bound resource always locates and verifies its catalog on
+    its own; callers cannot bypass the gate by omitting parameters.
+    """
+    from .retirement import gate_for_db, RetirementError
+    gate = gate_for_db(db_path, 'warehouse_db')
+    if gate is None:
+        return None
+    # gate_for_db already rejected any active maintenance request.
+    return gate, RetirementError
+
+
 def apply_batch(db_path, data):
     """Validate and atomically commit one batch; idempotent on batch_id."""
     batch_id, events = validate_batch(data)
     digest = canonical_digest(data)
+    gate_pack = _retirement_gate(db_path)
+    gate = gate_pack[0] if gate_pack is not None else None
+    RetirementError = gate_pack[1] if gate_pack is not None else ValueError
     conn = connect(db_path)
     try:
         ensure_schema(conn)
@@ -451,9 +469,21 @@ def apply_batch(db_path, data):
             if row[2] != digest:
                 raise ValueError('batch_id was already committed with different content')
             conn.execute('COMMIT')
+            # A batch (including an old successful batch_id being replayed) is
+            # rejected wholesale as soon as it mentions a blocked trace.
+            if gate is not None:
+                for _kind, _seq, trace_id, _payload in events:
+                    if gate.is_blocked(trace_id):
+                        raise RetirementError(
+                            'batch contains retired trace id: ' + trace_id)
             return {'batch_id': batch_id, 'seq_from': row[0], 'seq_to': row[1],
                     'events': len(events), 'replayed': True,
                     'max_seq': _get_max_seq(conn)}
+        if gate is not None:
+            for _kind, _seq, trace_id, _payload in events:
+                if gate.is_blocked(trace_id):
+                    raise RetirementError(
+                        'batch contains retired trace id: ' + trace_id)
         result = apply_locked(conn, batch_id, events, digest)
         conn.execute('COMMIT')
         return result
@@ -462,6 +492,8 @@ def apply_batch(db_path, data):
         raise
     finally:
         conn.close()
+        if gate is not None:
+            gate.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +511,10 @@ def query(db_path, data):
     path = Path(db_path)
     if not path.exists():
         return _zero_result(service, start, end)
+    # A bound warehouse verifies its catalog and closes querying while a
+    # retirement request is active; a lost or mismatched catalog closes too.
+    gate_pack = _retirement_gate(db_path)
+    gate = gate_pack[0] if gate_pack is not None else None
     conn = connect(path)
     try:
         is_warehouse = conn.execute(
@@ -524,3 +560,5 @@ def query(db_path, data):
             raise
     finally:
         conn.close()
+        if gate is not None:
+            gate.close()
