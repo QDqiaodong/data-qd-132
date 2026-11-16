@@ -244,3 +244,90 @@ published_quarantined}`，分别为请求 trace 数、实际清除的仓库 trac
 分块/逐行流式进行，SQLite 页缓存受限并允许临时落盘，任一时刻只物化一条
 trace 或一行 JSONL，工作内存（含数据库缓存）上限 64 MiB，不随目标总数或
 输出总量增长。
+
+# Revision-aware persistent SLO alerting contract v5
+
+在已有离线仓库之上增加按根服务的持续延迟违约（SLO）告警管道与离线通知投递
+队列。仅用 Python 标准库，与仓库共享同一个 SQLite 文件与同一套写事务。
+采样选择不参与本业务，占用直方图不能替代请求慢率。入口：`slo-init`、
+`slo-status`、`slo-claim`、`slo-ack`，均输出严格 JSON；任何契约违规退出 2。
+SLO 与 retirement catalog 互斥：`slo-init` 拒绝已绑定 catalog 的仓库，
+`retire-traces` 初始化拒绝已启用 SLO 的仓库，且两类互斥检查都发生在任何
+绑定或清理写之前。
+
+## 配置与初始化
+
+CONFIG 严格为 `{capacity,policies}`。`capacity` 为 1..10000 的未确认通知
+容量（整数，bool 拒绝）；`policies` 为 1..100 个不同 service 的策略，每项
+严格为 `{service,slow_ticks,short_n,long_n,open_ppm,close_ppm}`：时间整数
+0..10^12，`1<=short_n<=long_n<=10^6`，`0<=close_ppm<open_ppm<=10^6`，所有
+整数拒绝 bool，未知字段/重复 JSON 键拒绝。配置按解析内容计算规范化 SHA256：
+初始化后不可更改，同解析内容重试幂等（`replayed=true`，不写入），不同内容
+退出 2。可在已有未纳管（无 catalog）仓库上初始化，以其当前封存集合单次
+流式扫描计算初态；初始化失败整体回滚，不留下 enabled 标记、策略行或部分
+通知。enabled 标记是启用事务内最后一个写入。
+
+## 请求事实与两窗索引
+
+每条 sealed trace 只由其唯一根 span 提供一个请求事实：service=根服务、
+完成时间=根 end、慢请求当且仅当根 `(end-start)>=slow_ticks`。draft 不贡献；
+旧 trace 重开、改根时间/服务、再次 seal 必须撤销旧事实并按正确位置补入。
+事实按 `(end 升序, trace_id 的 UTF-8 字节序升序)` 全序排列，每服务一棵
+持久 AVL 顺序统计树（节点缓存子树大小与慢数），支持旧事实删除、同 tick
+确定次序与边界补位——不是只追加队列。各服务最后 `short_n`、`long_n` 条
+事实分别形成短窗/长窗，保留恰好 N 条而非整个同 tick 组；不足 N 时用现有
+全部请求。只改子 span 的 service/耗时时根事实归属与慢率不变。窗口慢数是
+O(log M) 的顺序统计查询（秩定位 + 前缀/后缀子树聚合），不按 N 扫描窗口、
+不扫描其他 trace 的 span、不全量重建服务请求集合；每触及 trace 的事实秩
+维护与两窗取值为 O(log M) 最坏。
+
+## 告警状态机
+
+每服务初始 healthy。长窗已满且短/长两窗慢率均 `>=open_ppm` 时转 firing；
+firing 时任一窗慢率 `<=close_ppm` 或长窗不足即转 healthy，其余保留原状态。
+所有比例用整数交叉相乘精确比较（不引入浮点）。每次状态翻转恰好追加一条
+通知，初始化也按同一规则产生初始 open。通知严格含 `event_id、service、
+transition(open/close)、max_seq、short_bad、short_total、long_bad、long_total`，
+保存翻转瞬间的值，之后任何修订都不改变已保存通知。`event_id` 全库从 1
+连续分配，失败事务不占号。
+
+## 容量反向约束
+
+只有“当前未确认通知数 + 本批最终所需新通知数 <= capacity”时，warehouse
+批次才可在同一事务共同提交请求事实、占用索引、max_seq、批次身份、告警状态
+与全部通知；否则整批退出 2 并保留所有旧状态（span、贡献、窗口、max_seq、
+batch_id 全部回滚）。已确认通知不再占容量但永久保留为幂等证据，不得覆盖
+未确认通知、吞掉翻转或提前推进数据。无状态翻转的合法批次在容量已满时仍可
+提交；普通 warehouse 入口与 Python API 无法靠省略参数绕过。一个批次内含
+两个服务翻转但只剩一个槽位时，两个都不提交。
+
+## 投递：claim / ack
+
+claim 请求严格为 `{consumer,now,lease_ticks,limit}`：`now` 为 0..10^12
+整数，`lease_ticks` 为 1..10^6 且 `now+lease_ticks<=10^12`，`limit` 为
+1..100。ack 严格为 `{consumer,now,items}`，items 是 1..100 个互异的
+`{event_id,token}`，token 为领取时返回的非空字符串。两操作的 `now` 在全库
+单调不倒退，同 tick 允许；契约错误不推进时钟。claim 按 event_id 选择尚未
+确认且未被租用（或租期已到）的通知，返回原通知、新 token 与 `expires_at`；
+每次重新领取必须换 token，空结果也推进时钟。仅当 `now<expires_at` 时才
+允许持有该 token 的 consumer 确认；过期、被重新领取的旧 token、consumer
+不符或未知 event_id 使整次 ack 失败（多项中任一非法则任何项都不确认）。
+已成功确认的相同 consumer/token 再次确认幂等（即使此后过期），其他 token
+不能确认已确认项。确认释放容量并保留幂等证据，领取不释放容量。claim/ack
+各自原子提交，进程在 COMMIT 前后终止重开后既无已入库却丢通知，也无未入库
+幽灵通知。
+
+## 状态快照
+
+`slo-status` 在单个只读快照返回 `max_seq`、按 service UTF-8 字节序排列的
+当前计数与 healthy/firing 状态，以及未确认通知总数；快照内各值严格对应。
+
+## 空间与恢复代价
+
+两窗索引为每服务每事实一行 AVL 节点（含父/左右孩子、高度、子树大小、慢数、
+end、trace 字节与慢标志），空间 O(M)；节点 id 每服务单调不复用。通知行
+永久保留（含已确认），lease 与 ack 幂等证据各一行，空间分别随未投递/已
+确认通知数线性增长；容量只约束未确认部分。所有写入与 warehouse 批次同
+事务，COMMIT 前终止整体回滚，重开后重试精确幂等；SQLite 页缓存受限
+（16 MiB）、临时排序落盘，SLO 工作内存（含缓存）最多 32 MiB，不随 M 或 N
+增长，支持每服务百万封存根请求与 100 个策略。

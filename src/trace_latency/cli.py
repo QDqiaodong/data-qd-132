@@ -6,6 +6,7 @@ from .model import analyze
 from . import warehouse
 from . import sampler
 from . import retirement
+from . import slo
 
 
 def run(source):
@@ -48,13 +49,29 @@ def command_parser():
     retired.add_argument('--state', type=Path, required=True)
     retired.add_argument('--output', type=Path, required=True)
     retired.add_argument('--source', type=Path, required=True)
+    sinit = sub.add_parser('slo-init',
+                           help='enable the persistent SLO alert pipeline on a warehouse')
+    sinit.add_argument('--db', type=Path, required=True)
+    sinit.add_argument('--source', type=Path, required=True)
+    sstat = sub.add_parser('slo-status',
+                           help='read an SLO snapshot (alert states and unacked count)')
+    sstat.add_argument('--db', type=Path, required=True)
+    sclaim = sub.add_parser('slo-claim',
+                            help='claim unacked SLO notifications with a lease')
+    sclaim.add_argument('--db', type=Path, required=True)
+    sclaim.add_argument('--source', type=Path, required=True)
+    sack = sub.add_parser('slo-ack',
+                          help='acknowledge claimed SLO notifications atomically')
+    sack.add_argument('--db', type=Path, required=True)
+    sack.add_argument('--source', type=Path, required=True)
     return parser
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in ('warehouse-apply', 'warehouse-query',
-                            'sample-traces', 'retire-traces'):
+                            'sample-traces', 'retire-traces',
+                            'slo-init', 'slo-status', 'slo-claim', 'slo-ack'):
         args = command_parser().parse_args(argv)
     else:
         args = legacy_parser().parse_args(argv)
@@ -65,6 +82,25 @@ def main(argv=None):
                 args.catalog, args.db, args.state, args.output, args.source)
             report = {'schema_version': 4, 'kind': 'retire_traces',
                       'result': result}
+        elif args.command == 'slo-init':
+            data, digest = read(args.source)
+            result = slo.slo_init(args.db, data)
+            report = {'schema_version': 5, 'kind': 'slo_init',
+                      'source_sha256': digest, 'result': result}
+        elif args.command == 'slo-status':
+            result = slo.slo_status(args.db)
+            report = {'schema_version': 5, 'kind': 'slo_status',
+                      'result': result}
+        elif args.command == 'slo-claim':
+            data, digest = read(args.source)
+            result = slo.slo_claim(args.db, data)
+            report = {'schema_version': 5, 'kind': 'slo_claim',
+                      'source_sha256': digest, 'result': result}
+        elif args.command == 'slo-ack':
+            data, digest = read(args.source)
+            result = slo.slo_ack(args.db, data)
+            report = {'schema_version': 5, 'kind': 'slo_ack',
+                      'source_sha256': digest, 'result': result}
         elif args.command == 'sample-traces':
             report = sampler.sample_traces(args.source, args.state,
                                            args.output, args.policy)

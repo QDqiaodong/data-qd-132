@@ -204,6 +204,15 @@ def _verify_warehouse_resource(path):
             raise RetirementError('not a trace-latency warehouse: ' + path)
         if _read_meta(conn, 'warehouse_version') is None:
             raise RetirementError('not a trace-latency warehouse: ' + path)
+        # SLO pipeline and the retirement catalog are mutually exclusive; the
+        # check happens before any binding or cleanup-style write.
+        has_slo = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='slo_meta'"
+        ).fetchone() is not None
+        if has_slo and conn.execute(
+                "SELECT 1 FROM slo_meta WHERE key='enabled'").fetchone() is not None:
+            raise RetirementError(
+                'warehouse has the SLO pipeline enabled; retirement catalog is mutually exclusive')
         return _read_meta(conn, CATALOG_META_KEY)
     finally:
         conn.close()

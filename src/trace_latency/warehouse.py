@@ -164,6 +164,11 @@ def connect(db_path):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=10000')
     conn.execute('PRAGMA foreign_keys=ON')
+    # SLO window trees may sort/spill on disk; keep the SQLite page cache
+    # bounded so SLO working memory (cache included) stays under 32 MiB and
+    # never grows with M or N.
+    conn.execute('PRAGMA temp_store=FILE')
+    conn.execute('PRAGMA cache_size=-16384')
     return conn
 
 
@@ -417,6 +422,19 @@ def apply_locked(conn, batch_id, events, digest, touched=None):
     for offset, (kind, seq, _trace_id, _payload) in enumerate(events):
         if seq != max_seq + 1 + offset:
             raise ValueError('seq must continue the global 1..N sequence')
+    # SLO pre-snapshot: old request facts are captured before any event in
+    # this batch changes trace/span state, so reopen/reseal revisions can be
+    # diffed against the exact previous contribution.
+    from . import slo as slo_mod
+    touched_trace_ids = []
+    seen_ids = set()
+    for _kind, _seq, trace_id, _payload in events:
+        if trace_id not in seen_ids:
+            seen_ids.add(trace_id)
+            touched_trace_ids.append(trace_id)
+    slo_active = slo_mod.is_enabled(conn)
+    old_facts = (slo_mod.pre_batch_snapshot(conn, touched_trace_ids)
+                 if slo_active else None)
     cache = {}
     for kind, seq, trace_id, payload in events:
         state = _load_state(conn, cache, trace_id)
@@ -432,6 +450,12 @@ def apply_locked(conn, batch_id, events, digest, touched=None):
         'INSERT INTO batches(batch_id,seq_from,seq_to,content_sha) VALUES(?,?,?,?)',
         (batch_id, max_seq + 1, new_max, digest))
     _cleanup_zero_nodes(conn, touched)
+    # SLO evaluation on the final sealed set of the whole batch only (never on
+    # intra-batch transient states).  The capacity gate raises inside the same
+    # transaction, rolling spans, contributions, max_seq, batch identity,
+    # alert states and notifications back together.
+    if slo_active:
+        slo_mod.apply_batch_hook(conn, touched_trace_ids, new_max, old_facts)
     return {'batch_id': batch_id, 'seq_from': max_seq + 1, 'seq_to': new_max,
             'events': len(events), 'replayed': False, 'max_seq': new_max}
 

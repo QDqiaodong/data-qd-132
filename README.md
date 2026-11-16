@@ -27,6 +27,11 @@ python3 -m venv .venv
 .venv/bin/trace-latency retire-traces --catalog run/retire-catalog \
     --db run/warehouse.db --state run/sample-state --output run/sample-out \
     --source run/retire-request.json
+# 持久 SLO 告警管道：初始化、快照、离线通知领取与确认
+.venv/bin/trace-latency slo-init --db run/warehouse.db --source run/slo-config.json
+.venv/bin/trace-latency slo-status --db run/warehouse.db
+.venv/bin/trace-latency slo-claim --db run/warehouse.db --source run/claim.json
+.venv/bin/trace-latency slo-ack --db run/warehouse.db --source run/ack.json
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -307,6 +312,96 @@ sampler 对屏蔽 ID 的合法 span/finish 直接跳过（允许内容不同、�
 `TRACE_LATENCY_RETIRE_CRASH=accept|warehouse_commit|sampler_commit|
 wmbefore:W|wmafterfiles:W|wmdone:W|complete` 仅测试使用，在对应边界杀进程，
 由 `tests/test_retirement_crash.py` 用子进程故障注入覆盖恢复与阻断。
+
+## 可修订遥测上的持久 SLO 告警管道（slo-init / slo-status / slo-claim / slo-ack）
+
+SLO 管道在已有离线仓库上按**根服务最近完成的请求**判断延迟是否持续违约，
+并让离线通知消费者以租约 + 确认的方式可靠领取告警。它与仓库共享同一个
+SQLite 文件和同一套写事务；占用直方图不参与本业务（请求慢率来自根 span，
+不是并发占用），尾部采样也不参与。Python API 与 CLI 同名：
+
+```python
+from trace_latency import slo_init, slo_status, slo_claim, slo_ack
+
+slo_init(db_path, {
+    "capacity": 1000,
+    "policies": [
+        {"service": "api", "slow_ticks": 100, "short_n": 100, "long_n": 1000,
+         "open_ppm": 500000, "close_ppm": 100000},
+    ],
+})
+slo_status(db_path)
+# {'max_seq':..., 'unacked':n, 'services':[{'service','state','requests'}, ...]}
+claim = slo_claim(db_path, {"consumer": "oncall-a", "now": 100,
+                            "lease_ticks": 60, "limit": 50})
+# {'consumer','now','returned', 'items':[{'event_id','notification',
+#   'token','expires_at'}, ...]}
+slo_ack(db_path, {"consumer": "oncall-a", "now": 120, "items": [
+    {"event_id": claim["items"][0]["event_id"],
+     "token": claim["items"][0]["token"]}]})
+# {'consumer','now','acked','newly_acked'}
+```
+
+### CLI 与严格 JSON 规则
+
+* `slo-init --db DB --source CONFIG`、`slo-claim --db DB --source REQUEST`、
+  `slo-ack --db DB --source REQUEST` 读取 8MB 上限的受限 JSON（重复键、未知
+  字段、非有限数拒绝，布尔不冒充整数），成功报告带 `source_sha256`；
+  `slo-status --db DB` 无输入文件。四个命令均向 stdout 打印严格 JSON，任何
+  校验/计算错误退出 2。
+* CONFIG 严格为 `{capacity,policies}`：`capacity` 是 1..10000 的未确认通知
+  容量；`policies` 是 1..100 个不同 service 的
+  `{service,slow_ticks,short_n,long_n,open_ppm,close_ppm}`，满足
+  `1<=short_n<=long_n<=10^6`、`0<=close_ppm<open_ppm<=10^6`、时间
+  0..10^12，所有整数 `type(x) is int`（bool 拒绝）。
+* 配置初始化后不可更改：同解析内容（键序无关，按规范化 JSON SHA256 比较）
+  重试返回 `replayed=true` 且不写入；不同内容退出 2。可在已有未纳管仓库上
+  初始化，以当前封存集合单次流式扫描建立初态；初始化失败不留下 enabled
+  标记或部分通知。SLO 与 retirement catalog 互斥，互斥检查先于任何绑定/清理。
+
+### 请求窗口与告警语义
+
+每条 sealed trace 只由唯一根 span 贡献一个请求事实（service=根服务、
+完成时间=根 end、慢当且仅当根 `end-start>=slow_ticks`），按
+`(end 升序, trace_id UTF-8 字节序升序)` 全序排列。每服务最后 `short_n` /
+`long_n` 条事实分别构成短窗/长窗，**保留恰好 N 条**而非整个同 tick 组，
+不足 N 用全部现有请求；draft 不贡献，重开/改根/再封按旧事实撤销、新事实
+补位处理，只改子 span 不影响根请求归属与慢率。状态机：每服务初始
+healthy，长窗满且两窗慢率均 `>=open_ppm` 转 firing；firing 时任一窗慢率
+`<=close_ppm` 或长窗不足转 healthy；比例一律整数交叉相乘。每次翻转恰好
+一条不可变通知（含翻转瞬间的 `max_seq` 与两窗 bad/total），`event_id`
+全库从 1 连续分配，失败不占号。
+
+### 容量反向约束与投递
+
+warehouse 批次只有在“当前未确认数 + 本批最终新通知数 <= capacity”时才与
+请求事实、占用索引、max_seq、batch_id、告警状态、通知在**同一事务**提交，
+否则整批退出 2、全部旧状态保留；无翻转批次在容量满时仍可提交，普通入口与
+Python API 无法靠省略新参数绕过。claim 按 event_id 领取未确认且未租用
+（或租约到期）的通知，每次重新领取换发新 token，空结果也推进全库单调时钟；
+只有 `now<expires_at` 且 consumer/token 匹配才能 ack，过期/旧 token/消费者
+不符/未知 ID 使整次 ack 失败，多项 ack 全有或全无；相同 consumer/token 重复
+ack 幂等（即使已过期），确认释放容量但通知与幂等证据永久保留。
+
+### 两窗索引、通知保留与恢复代价
+
+* 两窗索引：每服务一棵持久 **AVL 顺序统计树**（表 `slo_requests`），每事实
+  一行，节点缓存子树大小与慢数；事实修订是“删旧节点 + 插新节点”的
+  O(log M) 操作，同 tick 次序由 `(end, trace_id UTF-8 字节)` 确定，支持
+  删除与边界补位，**不是只追加队列**。窗口慢数由秩定位 + 前缀/后缀子树聚合
+  在 O(log M) 次索引访问得到，不按 N 扫描窗口、不扫其他 trace 的 span、不
+  全量重建服务集合；空间 O(M)。
+* 通知保留：`slo_notifications` 永久保存全部 open/close（已确认也不删），
+  `slo_leases` 保存当前租约，`slo_ack_evidence` 永久保存确认用的
+  consumer/token 作为幂等证据；空间随历史通知数线性增长，容量只约束未确认
+  部分。节点 id 每服务单调递增不复用。
+* 恢复：所有 SLO 写都在 warehouse 的 `BEGIN IMMEDIATE` 事务内，DDL 也参与
+  事务；COMMIT 前进程终止则整体回滚（无已入库丢通知，也无幽灵通知），重开
+  后精确批次重试只生效一次。测试钩子
+  `TRACE_LATENCY_SLO_CRASH=init_commit|batch_commit|claim_commit|ack_commit`
+  仅测试使用，在对应 COMMIT 前杀进程，由 `tests/test_slo_crash.py` 子进程
+  故障注入覆盖。SQLite 页缓存限 16 MiB、临时排序落盘，SLO 工作内存（含缓存）
+  最多 32 MiB，不随 M 或 N 增长，支持每服务百万封存根请求与 100 个策略。
 
 ## 业务与样例结果
 
